@@ -1,0 +1,10 @@
+config.json
+state.json
+*.log
+tmp/
+bridge-venv/
+models/
+__pycache__/
+*.pyc
+*.wav
+*.ogg

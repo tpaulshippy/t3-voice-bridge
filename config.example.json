@@ -1,0 +1,13 @@
+{
+  "telegram_bot_token": "PASTE_FROM_BOTFATHER",
+  "telegram_chat_id": "PASTE_NUMERIC_CHAT_ID",
+  "t3_bearer": null,
+  "thread_ids": [],
+  "poll_interval": 5,
+  "voice": "af_heart",
+  "state_file": "./state.json",
+  "temp_dir": "./tmp",
+  "db_path": "/home/ubuntu/.t3/userdata/statev2.sqlite",
+  "models_dir": "./models",
+  "max_retries": 3
+}

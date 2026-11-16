@@ -1,0 +1,14 @@
+[Unit]
+Description=T3-Code to Telegram voice-note bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/t3-voice-bridge
+ExecStart=%h/t3-voice-bridge/bridge-venv/bin/python %h/t3-voice-bridge/bridge.py --config %h/t3-voice-bridge/config.json
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
