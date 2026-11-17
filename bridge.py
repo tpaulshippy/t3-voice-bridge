@@ -367,8 +367,17 @@ def process_run(cfg, con, tts, run_id, thread_id, status, tmpdir, dry_run=False,
     for i, c in enumerate(chunks, 1):
         wav = os.path.join(tmpdir, f"{re.sub(r'[^A-Za-z0-9_-]+', '_', run_id)}-{i}.wav")
         ogg = wav + ".ogg"
-        tts.synth(c, wav)
-        to_ogg(wav, ogg)
+        try:
+            tts.synth(c, wav)
+            to_ogg(wav, ogg)
+        except Exception:
+            log.exception("run %s chunk %d: synth failed, skipping", run_id, i)
+            note = f"{title}: couldn't voice this reply" + (f" (part {i}/{len(chunks)})" if len(chunks) > 1 else "")
+            if is_slack(cfg):
+                send_text_slack(cfg["slack_bot_token"], cfg["slack_channel"], note)
+            else:
+                send_text_note(cfg, note)
+            continue
         cap = caption_for(status, title, run_id, len(chunks), i)
         mid = deliver_voice(cfg, ogg, cap)
         if not mid:
