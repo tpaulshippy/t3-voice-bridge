@@ -1,0 +1,14 @@
+inbound.py
+  h_6bbd00fe0a456a 130,132-133
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "524d33c44247eebde29f337f0d0696108b0d56b1",
+  "prompts": {},
+  "humans": {
+    "h_6bbd00fe0a456a": {
+      "author": "Paul Shippy <pshippy@gmail.com>"
+    }
+  }
+}
