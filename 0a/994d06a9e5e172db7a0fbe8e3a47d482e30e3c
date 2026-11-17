@@ -1,0 +1,18 @@
+README.md
+  h_6bbd00fe0a456a 30-36,69-79,116,118-119
+serve.py
+  h_6bbd00fe0a456a 1-103
+t3-voice-bridge-serve.service
+  h_6bbd00fe0a456a 1-13
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0a994d06a9e5e172db7a0fbe8e3a47d482e30e3c",
+  "prompts": {},
+  "humans": {
+    "h_6bbd00fe0a456a": {
+      "author": "Paul Shippy <pshippy@gmail.com>"
+    }
+  }
+}
