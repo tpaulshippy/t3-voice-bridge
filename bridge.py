@@ -187,18 +187,21 @@ def to_ogg(wav_path, ogg_path):
     return ogg_path
 
 
-def send_voice(token, chat_id, ogg_path, caption, max_retries=3):
+def send_voice(token, chat_id, ogg_path, caption, max_retries=3, parse_mode=None):
     import requests
 
     url = f"https://api.telegram.org/bot{token}/sendVoice"
     cap = (caption or "")[:1024]
+    data = {"chat_id": chat_id, "caption": cap}
+    if parse_mode:
+        data["parse_mode"] = parse_mode
     last = None
     for attempt in range(1, max_retries + 1):
         try:
             with open(ogg_path, "rb") as f:
                 r = requests.post(
                     url,
-                    data={"chat_id": chat_id, "caption": cap},
+                    data=data,
                     files={"voice": ("voice.ogg", f, "audio/ogg")},
                     timeout=180,
                 )
@@ -309,30 +312,38 @@ def thread_link(cfg, thread_id):
     return f"{cfg['t3_web_url'].rstrip('/')}/{env}/{urllib.parse.quote(thread_id, safe='')}"
 
 
-def send_voice_link_slack(cfg, ogg_path, caption, thread_id=None, words=None):
+def send_voice_link_slack(cfg, ogg_path, text):
     """Copy ogg into audio_dir (served over tailnet) and post its link."""
     os.makedirs(cfg["audio_dir"], exist_ok=True)
     name = time.strftime("%Y%m%d-%H%M%S-") + os.urandom(4).hex() + ".ogg"
     shutil.copy(ogg_path, os.path.join(cfg["audio_dir"], name))
     url = cfg["audio_base_url"].rstrip("/") + "/" + name
-    secs = round(ogg_duration(ogg_path))
-    parts = [f"🔊 <{url}|{caption or 'voice'}>", f"{secs // 60}:{secs % 60:02d}"]
-    if words is not None:
-        parts.append(f"{words} words")
-    link = thread_id and thread_link(cfg, thread_id)
-    if link:
-        parts.append(f"<{link}|Open thread>")
-    return send_text_slack(cfg["slack_bot_token"], cfg["slack_channel"], " · ".join(parts))
+    title, _, rest = text.partition(" · ")
+    msg = f"🔊 <{url}|{title or 'voice'}>" + (f" · {rest}" if rest else "")
+    return send_text_slack(cfg["slack_bot_token"], cfg["slack_channel"], msg)
 
 
 def deliver_voice(cfg, ogg_path, caption, thread_id=None, words=None):
-    if is_slack(cfg) and cfg.get("audio_base_url"):
-        return send_voice_link_slack(cfg, ogg_path, caption, thread_id, words)
+    secs = round(ogg_duration(ogg_path))
+    meta = [caption, f"{secs // 60}:{secs % 60:02d}"]
+    if words is not None:
+        meta.append(f"{words} words")
+    link = thread_id and thread_link(cfg, thread_id)
     if is_slack(cfg):
+        text = " · ".join(meta + ([f"<{link}|Open thread>"] if link else []))
+        if cfg.get("audio_base_url"):
+            return send_voice_link_slack(cfg, ogg_path, text)
         return send_voice_slack(cfg["slack_bot_token"], cfg["slack_channel"],
-                                ogg_path, caption, cfg.get("max_retries", 3))
+                                ogg_path, text, cfg.get("max_retries", 3))
+    # Telegram only allows http(s)/tg links in HTML anchors; show others as plain text
+    import html
+    text = html.escape(" · ".join(meta))
+    if link and link.startswith(("http://", "https://")):
+        text += f' · <a href="{html.escape(link)}">Open thread</a>'
+    elif link:
+        text += f"\n{html.escape(link)}"
     return send_voice(cfg["telegram_bot_token"], cfg["telegram_chat_id"],
-                      ogg_path, caption, cfg.get("max_retries", 3))
+                      ogg_path, text, cfg.get("max_retries", 3), parse_mode="HTML")
 
 
 def caption_for(status, title, run_id, n_chunks=1, idx=1):
@@ -383,7 +394,14 @@ def process_run(cfg, con, tts, run_id, thread_id, status, tmpdir, dry_run=False,
               f"caption={title[:80]!r}")
         return True
     ok_all = True
+    done = load_state(cfg["state_file"]).get("sent_parts", {}).get(run_id, {})
     for i, c in enumerate(chunks, 1):
+        if str(i) in done:
+            log.info("run %s part %d already sent, skipping", run_id, i)
+            mid = done[str(i)]
+            if sent_ids is not None and isinstance(mid, int):
+                sent_ids.append((mid, thread_id))
+            continue
         wav = os.path.join(tmpdir, f"{re.sub(r'[^A-Za-z0-9_-]+', '_', run_id)}-{i}.wav")
         ogg = wav + ".ogg"
         try:
@@ -396,12 +414,14 @@ def process_run(cfg, con, tts, run_id, thread_id, status, tmpdir, dry_run=False,
                 send_text_slack(cfg["slack_bot_token"], cfg["slack_channel"], note)
             else:
                 send_text_note(cfg, note)
+            mark_part_sent(cfg["state_file"], run_id, i, None)
             continue
         cap = caption_for(status, title, run_id, len(chunks), i)
         mid = deliver_voice(cfg, ogg, cap, thread_id, len(c.split()))
         if not mid:
             ok_all = False
             break  # do not advance watermark; retry next poll
+        mark_part_sent(cfg["state_file"], run_id, i, mid)
         if sent_ids is not None and isinstance(mid, int):
             sent_ids.append((mid, thread_id))
         for p in (wav, ogg):
@@ -409,7 +429,21 @@ def process_run(cfg, con, tts, run_id, thread_id, status, tmpdir, dry_run=False,
                 os.remove(p)
             except OSError:
                 pass
+    if ok_all:
+        mark_part_sent(cfg["state_file"], run_id, None, None)
     return ok_all
+
+
+def mark_part_sent(state_path, run_id, idx, mid):
+    """Record a sent part so retries don't resend it; idx=None clears the run."""
+    state = load_state(state_path)
+    parts = state.setdefault("sent_parts", {})
+    if idx is None:
+        if parts.pop(run_id, None) is None:
+            return
+    else:
+        parts.setdefault(run_id, {})[str(idx)] = mid
+    save_state(state_path, state)
 
 
 def send_text_note(cfg, text):
@@ -590,6 +624,7 @@ def main():
                     if sent:
                         record_outbound(state_path, sent, cfg)
                     global_wm = max(global_wm, completed_at)
+                    state = load_state(state_path)
                     state["_global"] = global_wm
                     state[thread_id] = max(state.get(thread_id, ""), completed_at)
                     save_state(state_path, state)
