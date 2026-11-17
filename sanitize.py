@@ -38,6 +38,14 @@ def sanitize(text: str) -> str:
         s = re.sub(r"^(\d+[.)]|[-*+])\s+", "", s)
         s = re.sub(r"^#{1,6}\s*", "", s)
         s = re.sub(r"^(-{3,}|_{3,}|\*{3,})$", "", s)
+        # tables: drop separator rows, turn cells into a spoken list
+        if re.fullmatch(r"\|?[\s:|-]*-[\s:|-]*\|?", s):
+            s = ""
+        elif s.startswith("|"):
+            s = ", ".join(c.strip() for c in s.strip("|").split("|") if c.strip())
+        # end each line as a sentence so TTS batches stay short
+        if s and s[-1] not in ".!?:;,":
+            s += "."
         lines.append(s)
     t = "\n".join(lines)
     t = _html_re.sub("", t)
