@@ -1,4 +1,8 @@
 {
+  "transport": "telegram",
+  "slack_bot_token": "xoxb-...",
+  "slack_channel": "C0123456789",
+  "audio_base_url": null,
   "telegram_bot_token": "PASTE_FROM_BOTFATHER",
   "telegram_chat_id": "PASTE_NUMERIC_CHAT_ID",
   "t3_bearer": null,
