@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/t3-voice-bridge
-ExecStart=%h/t3-voice-bridge/bridge-venv/bin/python %h/t3-voice-bridge/bridge.py --config %h/t3-voice-bridge/config.json
+WorkingDirectory=%h/repos/t3-voice-bridge
+ExecStart=%h/repos/t3-voice-bridge/bridge-venv/bin/python %h/repos/t3-voice-bridge/bridge.py --config %h/repos/t3-voice-bridge/config.json
 Restart=on-failure
 RestartSec=10
 

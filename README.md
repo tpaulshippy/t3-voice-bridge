@@ -1,7 +1,14 @@
-# T3-Code → Telegram voice-note bridge
+# T3-Code ↔ Telegram voice bridge
 
-Daemon: watches T3 thread runs (read-only SQLite tail), synthesizes completed
-assistant replies with Kokoro TTS, delivers them as Telegram voice notes.
+Two-way voice loop, two daemons:
+
+- **Outbound** (`bridge.py`): watches T3 thread runs (read-only SQLite
+  tail), synthesizes completed assistant replies with Kokoro TTS, delivers
+  them as Telegram voice notes. Records which thread each voice note came
+  from.
+- **Inbound** (`inbound.py`): long-polls Telegram for voice notes,
+  transcribes with faster-whisper, injects the text back into the thread
+  the voice note came from (reply-aware routing, most-recent fallback).
 
 ## Setup
 
@@ -10,7 +17,7 @@ assistant replies with Kokoro TTS, delivers them as Telegram voice notes.
    `curl https://api.telegram.org/bot<TOKEN>/getUpdates` → `message.chat.id`.
 3. Install:
    ```
-   cd ~/t3-voice-bridge
+   cd ~/repos/t3-voice-bridge
    ./setup.sh
    ```
    Downloads fp32 `kokoro-v1.0.onnx` (~310MB) + `voices-v1.0.bin` into `models/`.
@@ -24,7 +31,8 @@ assistant replies with Kokoro TTS, delivers them as Telegram voice notes.
    ```
    ./bridge-venv/bin/python bridge.py --once --dry-run
    ```
-6. Run / enable:
+6. Run / enable (outbound; repeat with `t3-voice-bridge-inbound` for the
+   inbound leg once `inbound_enabled: true` is set — see below):
    ```
    ./bridge-venv/bin/python bridge.py
    # systemd user unit:
@@ -114,17 +122,20 @@ so nothing to configure there.
 
 1. `./setup.sh` (adds `faster-whisper` + `websockets` to the venv, prefetches
    the tiny STT model into `~/.cache/huggingface`).
-2. Find your thread id (copy the sqlite first — WAL + read-only reads go stale):
+2. Find a thread id (copy the sqlite first — WAL + read-only reads go
+   stale, so copy all three files):
    ```
-   cp ~/.t3/userdata/statev2.sqlite /tmp/s.sqlite
-   sqlite3 /tmp/s.sqlite "SELECT thread_id, title FROM orchestration_v2_projection_threads WHERE title LIKE '%Voice%';"
+   cp ~/.t3/userdata/statev2.sqlite{,-wal,-shm} /tmp/
+   sqlite3 /tmp/statev2.sqlite "SELECT thread_id, title FROM orchestration_v2_projection_threads WHERE title LIKE '%Voice%';"
    ```
 3. Edit `config.json`:
    `inbound_enabled: true`,
-   `inbound_thread_id: "<uuid>"` (required),
+   optional `inbound_thread_id: "<uuid>"` safety-net override (normally
+   leave `null` — routing follows the most recent voice note's thread),
    optional `stt_model` (default `"tiny"`) and `stt_language` (default `"en"`).
-4. Test once: `./bridge-venv/bin/python inbound.py --once` (send yourself a
-   voice note first, or use `--dry-run` to only transcribe + print).
+4. Test: send yourself a voice note, then
+   `./bridge-venv/bin/python inbound.py --once` (real inject), or add
+   `--dry-run` to only transcribe + print without injecting or messaging.
 5. Enable: `cp t3-voice-bridge-inbound.service ~/.config/systemd/user/`,
    `systemctl --user daemon-reload`,
    `systemctl --user enable --now t3-voice-bridge-inbound`.
