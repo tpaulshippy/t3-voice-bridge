@@ -1,0 +1,16 @@
+bridge.py
+  h_6bbd00fe0a456a 55-56,309-318,324
+config.example.json
+  h_6bbd00fe0a456a 17-20
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "37cb164f966242dfc43b02a0ad070f0b3f9c5ea9",
+  "prompts": {},
+  "humans": {
+    "h_6bbd00fe0a456a": {
+      "author": "Paul Shippy <pshippy@gmail.com>"
+    }
+  }
+}
