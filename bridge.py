@@ -46,6 +46,7 @@ def load_config(path):
         "max_retries": 3,
         "transport": "telegram",
         "audio_dir": "./audio",
+        "audio_retention_days": 7,
         "audio_base_url": None,
         "t3_web_url": "t3code://threads",
         "t3_environment_id": None,
@@ -267,7 +268,7 @@ def send_voice_slack(token, channel, ogg_path, caption, max_retries=3):
                 raise RuntimeError(f"getUploadURLExternal: {up}")
             with open(ogg_path, "rb") as f:
                 r = requests.post(up["upload_url"],
-                                  files={"file": ("voice.ogg", f, "audio/ogg")},
+                                  data=f, headers={"Content-Type": "audio/ogg"},
                                   timeout=180)
             if r.status_code != 200:
                 raise RuntimeError(f"upload http={r.status_code}")
@@ -312,15 +313,35 @@ def thread_link(cfg, thread_id):
     return f"{cfg['t3_web_url'].rstrip('/')}/{env}/{urllib.parse.quote(thread_id, safe='')}"
 
 
+def is_msg_id(mid):
+    """Telegram message ids only; Slack sends return True (bool is an int)."""
+    return isinstance(mid, int) and not isinstance(mid, bool)
+
+
+def prune_audio(cfg):
+    cutoff = time.time() - cfg["audio_retention_days"] * 86400
+    for p in Path(cfg["audio_dir"]).glob("*.ogg"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+        except OSError:
+            pass
+
+
 def send_voice_link_slack(cfg, ogg_path, text):
     """Copy ogg into audio_dir (served over tailnet) and post its link."""
     os.makedirs(cfg["audio_dir"], exist_ok=True)
+    prune_audio(cfg)
     name = time.strftime("%Y%m%d-%H%M%S-") + os.urandom(4).hex() + ".ogg"
-    shutil.copy(ogg_path, os.path.join(cfg["audio_dir"], name))
+    dest = os.path.join(cfg["audio_dir"], name)
+    shutil.copy(ogg_path, dest)
     url = cfg["audio_base_url"].rstrip("/") + "/" + name
     title, _, rest = text.partition(" · ")
     msg = f"🔊 <{url}|{title or 'voice'}>" + (f" · {rest}" if rest else "")
-    return send_text_slack(cfg["slack_bot_token"], cfg["slack_channel"], msg)
+    ok = send_text_slack(cfg["slack_bot_token"], cfg["slack_channel"], msg)
+    if not ok:
+        os.remove(dest)
+    return ok
 
 
 def deliver_voice(cfg, ogg_path, caption, thread_id=None, words=None):
@@ -399,7 +420,7 @@ def process_run(cfg, con, tts, run_id, thread_id, status, tmpdir, dry_run=False,
         if str(i) in done:
             log.info("run %s part %d already sent, skipping", run_id, i)
             mid = done[str(i)]
-            if sent_ids is not None and isinstance(mid, int):
+            if sent_ids is not None and is_msg_id(mid):
                 sent_ids.append((mid, thread_id))
             continue
         wav = os.path.join(tmpdir, f"{re.sub(r'[^A-Za-z0-9_-]+', '_', run_id)}-{i}.wav")
@@ -422,7 +443,7 @@ def process_run(cfg, con, tts, run_id, thread_id, status, tmpdir, dry_run=False,
             ok_all = False
             break  # do not advance watermark; retry next poll
         mark_part_sent(cfg["state_file"], run_id, i, mid)
-        if sent_ids is not None and isinstance(mid, int):
+        if sent_ids is not None and is_msg_id(mid):
             sent_ids.append((mid, thread_id))
         for p in (wav, ogg):
             try:
