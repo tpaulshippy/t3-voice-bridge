@@ -127,8 +127,10 @@ def download_voice(cfg, file_id, tmpdir):
 
 
 def to_wav_16k(src, dst):
+    ffmpeg = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
     r = subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", src,
+        [ffmpeg if os.path.exists(ffmpeg) else "ffmpeg",
+         "-y", "-v", "error", "-i", src,
          "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", dst],
         capture_output=True, text=True,
     )
