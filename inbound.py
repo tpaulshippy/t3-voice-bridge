@@ -45,6 +45,8 @@ def load_config(path):
         "temp_dir": "./tmp",
         "db_path": "/home/ubuntu/.t3/userdata/statev2.sqlite",
         "max_retries": 3,
+        "mac_bearer": None,
+        "mac_host": "100.84.1.93",
     }
     defaults.update(cfg)
     for k in ("state_file", "temp_dir"):
@@ -199,19 +201,19 @@ def mint_bearer():
     return tok
 
 
-def fetch_ticket(bearer):
+def fetch_ticket(bearer, host="127.0.0.1"):
     req = urllib.request.Request(
-        "http://127.0.0.1:3773/api/auth/websocket-ticket/rpc", data=b"{}",
+        f"http://{host}:3773/api/auth/websocket-ticket/rpc", data=b"{}",
         headers={"Authorization": f"Bearer {bearer}",
                  "Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.load(resp)["ticket"]
 
 
-async def _ws_dispatch(ticket, payload):
+async def _ws_dispatch(ticket, payload, host="127.0.0.1"):
     import websockets
 
-    url = (f"ws://127.0.0.1:3773/ws?wsTicket={ticket}"
+    url = (f"ws://{host}:3773/ws?wsTicket={ticket}"
            "&orchestrationProtocol=2&clientCapabilities=settingsSecretReferences")
     async with websockets.connect(url, max_size=10 * 1024 * 1024) as ws:
         await ws.send(json.dumps([{"_tag": "Request", "id": 0,
@@ -247,6 +249,36 @@ def t3_inject(thread_id, text):
     raise RuntimeError(f"dispatch failed: {str(exit_frame)[:500]}")
 
 
+def t3_inject_mac(cfg, thread_id, text):
+    """Inject user text into a thread on the Mac T3 server (over Tailscale).
+
+    Uses the long-lived mac_bearer minted on the Mac; ticket + WS-RPC go
+    to mac_host:3773 directly. Returns server sequence number.
+    """
+    bearer = cfg.get("mac_bearer")
+    if not bearer:
+        raise RuntimeError("mac_bearer not configured; mint on the Mac via "
+                           "`t3 auth session issue` and add to config.json")
+    host = cfg.get("mac_host", "100.84.1.93")
+    payload = {
+        "type": "message.dispatch",
+        "createdBy": "user",
+        "creationSource": "server",
+        "commandId": str(uuid.uuid4()),
+        "threadId": thread_id,
+        "messageId": str(uuid.uuid4()),
+        "text": text,
+        "attachments": [],
+        "deliveryIntent": "auto",
+        "dispatchMode": {"type": "start_immediately"},
+    }
+    ticket = fetch_ticket(bearer, host)
+    exit_frame = asyncio.run(_ws_dispatch(ticket, payload, host))
+    if exit_frame.get("_tag") == "Success":
+        return exit_frame["value"].get("sequence")
+    raise RuntimeError(f"mac dispatch failed: {str(exit_frame)[:500]}")
+
+
 def resolve_target_thread(cfg, msg):
     """Reply-aware routing for an inbound Telegram message.
 
@@ -255,6 +287,8 @@ def resolve_target_thread(cfg, msg):
     inbound_thread_id override (may be empty/null, in which case routing
     is purely reply-aware). Re-reads state from disk so the outbound
     daemon's map is always fresh.
+    Values may carry a "mac:" prefix (synced from the Mac bridge); those
+    threads live on the Mac T3 server and need remote inject.
     Returns (thread_id, how) where how is 'reply', 'recent', 'fallback',
     or (None, 'none') when no target can be determined.
     """
@@ -321,13 +355,19 @@ def process_update(cfg, update, tmpdir, dry_run=False):
                             "notes, or set inbound_thread_id.")
         return True  # advance: retrying wouldn't find a target either
     try:
-        seq = t3_inject(target_thread, text)
+        if target_thread.startswith("mac:"):
+            seq = t3_inject_mac(cfg, target_thread[4:], text)
+        else:
+            seq = t3_inject(target_thread, text)
     except Exception as e:
         log.exception("T3 inject failed")
         send_text_note(cfg, "⚠️ couldn't deliver that voice note to T3 "
                             f"({e}). Holding it — I'll retry automatically.")
         return False  # hold offset
-    title = thread_title(cfg, target_thread)
+    if target_thread.startswith("mac:"):
+        title = target_thread[4:12] + "… (Mac)"
+    else:
+        title = thread_title(cfg, target_thread)
     send_text_note(cfg, f"🎙 {transcript}\n\n→ delivered to “{title}” (seq {seq}).")
     log.info("injected voice note into %s (seq %s, %d chars, route=%s)",
              target_thread, seq, len(text), route_how)
