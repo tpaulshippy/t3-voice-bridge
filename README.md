@@ -10,7 +10,24 @@ Two-way voice loop, two daemons:
   transcribes with faster-whisper, injects the text back into the thread
   the voice note came from (reply-aware routing, most-recent fallback).
 
-## Setup
+## Topology: cloud primary + Mac satellite
+
+Telegram allows exactly **one** `getUpdates` holder per bot, so there is one
+inbound poller total. Outbound senders (`sendVoice`) don't conflict, so each
+machine voices its own local threads:
+
+- **shipmate (cloud, primary)**: outbound + inbound via systemd user units.
+  Watches shipmate threads, injects into shipmate threads.
+- **Mac (satellite)**: outbound only, via a launchd agent. Watches Mac
+  threads, voices them to the same Telegram chat.
+
+Cross-machine reply routing: the Mac outbound syncs its
+`message_id → thread` map into shipmate's `state.json` over SSH after every
+send (see `routing_sync_ssh`), tagging values `mac:`. Shipmate's inbound
+injects `mac:`-prefixed targets into the Mac's T3 server over Tailscale
+(`mac_host:3773`, bearer in `mac_bearer`) instead of localhost.
+
+## Setup (shipmate)
 
 1. Create a bot via [@BotFather](https://t.me/BotFather): `/newbot` → copy the token.
 2. Get your chat id: message your bot anything, then
@@ -43,6 +60,32 @@ Two-way voice loop, two daemons:
    journalctl --user -u t3-voice-bridge -f
    ```
 
+## Setup (Mac satellite, outbound only)
+
+`setup.sh` is Linux-oriented; on macOS do its steps by hand:
+
+```
+brew install espeak-ng          # ffmpeg already present
+python3 -m venv bridge-venv
+./bridge-venv/bin/pip install --upgrade pip
+./bridge-venv/bin/pip install kokoro-onnx soundfile numpy requests faster-whisper websockets
+mkdir -p models && cd models
+curl -fL -O https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/kokoro-v1.0.onnx
+curl -fL -O https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1/voices-v1.0.bin
+./bridge-venv/bin/python -c "from faster_whisper import WhisperModel; WhisperModel('tiny', device='cpu', compute_type='int8')"
+```
+
+Then `cp config.example.json config.json` and set `db_path` to
+`$HOME/.t3/userdata/statev2.sqlite`, plus `routing_sync_ssh` (below).
+The Mac needs SSH access to shipmate (`~/.ssh/config`: `Host shipmate`,
+`User ubuntu`, `IdentityFile ~/.ssh/id_ed25519`).
+
+Run under launchd (`~/Library/LaunchAgents/com.t3.voice-bridge.plist`
+pointing at `bridge-venv/bin/python .../bridge.py`, `RunAtLoad` +
+`KeepAlive`), then `launchctl load` it. Manage with
+`launchctl kickstart -k gui/$(id -u)/com.t3.voice-bridge`;
+logs in `bridge.log`.
+
 ## Config reference (`config.json`)
 
 | key | meaning | default |
@@ -58,6 +101,10 @@ Two-way voice loop, two daemons:
 | `db_path` | T3 sqlite (read-only) | `/home/ubuntu/.t3/userdata/statev2.sqlite` |
 | `models_dir` | kokoro models | `./models` |
 | `max_retries` | Telegram send retries with backoff | 3 |
+| `routing_sync_ssh` | (Mac only) ssh host of the inbound machine; after each send, merge our routing map into its `state.json` so replies route back to our threads. Unset = no sync | null |
+| `routing_sync_state` | remote `state.json` path for the sync above | `~/repos/t3-voice-bridge/state.json` |
+| `mac_bearer` | (shipmate inbound only) long-lived bearer minted **on the Mac** (`t3 auth session issue --scope orchestration:read --scope orchestration:operate --label shipmate-mac-inject --ttl 30d --token-only`) enabling inject into Mac threads | null |
+| `mac_host` | (shipmate inbound only) Mac Tailscale IP for ticket + WS-RPC | `100.84.1.93` |
 
 ## Watching only specific threads
 
@@ -75,13 +122,24 @@ history); with an empty list it starts at startup time.
 - Watermark advances ONLY after Telegram confirms `ok:true`.
 - Markdown is stripped for speech (code fences → "code omitted").
 - Logs to stdout + `bridge.log` (rotated, 1MB × 3).
+- If the Mac is asleep (or its T3 app closed), Mac-thread replies fail to
+  inject: Telegram gets a ⚠️ note and the offset is **held**, which also
+  stalls notes queued behind it until the Mac is back.
 
 ## Troubleshooting
 
 - **Token expired / 401 from Telegram**: create a fresh token with BotFather,
-  update `config.json`, `systemctl --user restart t3-voice-bridge`.
+  update `config.json`, `systemctl --user restart t3-voice-bridge`
+  (shipmate) or `launchctl kickstart -k ...` (Mac).
+- **409 Conflict from getUpdates**: another poller is holding the connection —
+  normally this daemon itself vs. a one-off `--once --dry-run` probe (harmless,
+  it retakes the poll). If persistent, two inbound instances are running;
+  stop one.
 - **t3 auth expiry**: bridge mints via `t3 auth session issue --scope
   orchestration:read --label telegram-bridge --ttl 30d` automatically.
+- **`mac_bearer` expiry** (~30d): Mac-thread replies fail with auth errors.
+  Re-mint on the Mac (command above) and update shipmate's `config.json`,
+  then `systemctl --user restart t3-voice-bridge-inbound`.
 - **Disk full**: models are ~350MB; `df -h` first. Free space under `~/repos`.
 - **ffmpeg errors**: check `bridge.log`; voice files must be opus/24000/mono
   (`ffprobe voice.ogg`). Re-run `--dry-run` to reproduce locally.
@@ -92,7 +150,7 @@ history); with an empty list it starts at startup time.
 
 ## Inbound: Telegram voice message → T3 thread
 
-Separate daemon (`inbound.py`, own systemd unit). Long-polls Telegram
+Separate daemon (`inbound.py`, own systemd unit on shipmate). Long-polls Telegram
 `getUpdates` for voice/audio notes from `telegram_chat_id`, downloads the
 `.ogg`, converts to 16k mono wav, transcribes with faster-whisper, and
 injects the text with a 🎙 prefix via the local server
@@ -100,16 +158,19 @@ WebSocket RPC (`orchestration.dispatchCommand` / `message.dispatch`,
 `deliveryIntent: auto`, `dispatchMode: start_immediately`). Telegram gets a
 text confirmation (transcript + status, e.g. server sequence number).
 
-Routing is reply-aware, not pinned to one thread: the outbound leg records
+Routing is reply-aware, not pinned to one thread: the outbound legs record
 every delivered voice note (`state.json`: `outbound_msg_thread`
 `{telegram_message_id: thread_id}`, capped at 200, plus
-`outbound_last_thread`). Precedence per inbound note:
+`outbound_last_thread`; Mac entries arrive via the SSH sync tagged `mac:`).
+Precedence per inbound note:
 **reply** (its `reply_to_message` matches a mapped outbound voice note) →
 **recent** (thread of the most recent outbound voice note) →
 **fallback** (`inbound_thread_id` override; may be left empty, in which case
 an unroutable note gets a Telegram explanation and is skipped). So a voice note sent
 freestanding lands in the thread of the last voice note you received, and a
 voice note sent as a reply to a specific voice note routes to that thread.
+`mac:` targets are injected into the Mac's T3 server over Tailscale instead
+of localhost.
 
 ### One-time setup
 
