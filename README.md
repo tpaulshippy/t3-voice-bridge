@@ -27,6 +27,13 @@ send (see `routing_sync_ssh`), tagging values `mac:`. Shipmate's inbound
 injects `mac:`-prefixed targets into the Mac's T3 server over Tailscale
 (`mac_host:3773`, bearer in `mac_bearer`) instead of localhost.
 
+Thread links (`Open thread` on voice notes) go through a redirector so they
+open the native app: `serve.py` on shipmate answers
+`https://shipmate.tail23a145.ts.net:8443/t/<env>/<thread>` with a page that
+bounces to `t3code://threads/<env>/<thread>` (meta refresh + JS + a manual
+button). Both bridges set `t3_web_url` (and shipmate `mac_web_url`) to that
+`/t` base. The same server serves `audio/` oggs for Slack link mode.
+
 ## Setup (shipmate)
 
 1. Create a bot via [@BotFather](https://t.me/BotFather): `/newbot` → copy the token.
@@ -58,6 +65,17 @@ injects `mac:`-prefixed targets into the Mac's T3 server over Tailscale
    systemctl --user daemon-reload
    systemctl --user enable --now t3-voice-bridge
    journalctl --user -u t3-voice-bridge -f
+   ```
+7. Thread-link redirector (so Telegram `Open thread` links open the
+   native app instead of dying as `t3code://` text):
+   ```
+   cp t3-voice-bridge-serve.service ~/.config/systemd/user/
+   systemctl --user daemon-reload
+   systemctl --user enable --now t3-voice-bridge-serve
+   sudo tailscale set --operator=$USER  # once; then no sudo needed
+   tailscale serve --bg --https=8443 http://127.0.0.1:3901
+   # set t3_web_url (and mac_web_url) to
+   # https://<tailnet-name>:8443/t in config.json
    ```
 
 ## Setup (Mac satellite, outbound only)
@@ -95,8 +113,10 @@ logs in `bridge.log`.
 | `slack_channel` | Slack channel id (e.g. `C0123…`) to post voice files into | — |
 | `audio_base_url` | (Slack) if set, skip file upload: copy ogg into `audio_dir` and post a link `<audio_base_url>/<file>` instead (no `files:write` needed) | null |
 | `audio_retention_days` | (Slack link mode) delete files in `audio_dir` older than this; old links stop working | 7 |
-| `t3_web_url` | (Slack link mode) base for the "Open thread" link: `<t3_web_url>/<env id>/<thread id>`. Default opens the desktop app | `t3code://threads` |
+| `t3_web_url` | base for the tappable "Open thread" link: `<t3_web_url>/<env id>/<thread id>`. Point at the redirector `…/t` so it opens the native app; a raw `https://host:3773` stays in the browser | `t3code://threads` (plain text, not tappable) |
 | `t3_environment_id` | T3 environment id for that link; read from `~/.t3/userdata/environment-id` when unset | null |
+| `mac_web_url` | (shipmate) redirector base for `mac:`-thread links; falls back to `http://<mac_host>:3773` (browser, not app) | null |
+| `mac_environment_id` | (shipmate) Mac environment id for `mac:`-thread links; without it those links are omitted | null |
 | `audio_dir` | dir served at `audio_base_url` (e.g. `python3 -m http.server 3901 --bind 127.0.0.1 --directory audio` + `tailscale serve --bg --https=13901 http://localhost:3901`) | `./audio` |
 | `telegram_bot_token` | BotFather token (required for real sends) | — |
 | `telegram_chat_id` | numeric chat id (required for real sends) | — |
@@ -179,7 +199,6 @@ freestanding lands in the thread of the last voice note you received, and a
 voice note sent as a reply to a specific voice note routes to that thread.
 `mac:` targets are injected into the Mac's T3 server over Tailscale instead
 of localhost.
-
 ### One-time setup
 
 No T3 Connect / webhook needed — the daemon talks to the local server over

@@ -1,0 +1,13 @@
+[Unit]
+Description=T3 voice bridge redirect/audio server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/repos/t3-voice-bridge
+ExecStart=%h/repos/t3-voice-bridge/bridge-venv/bin/python %h/repos/t3-voice-bridge/serve.py --port 3901 --audio-dir %h/repos/t3-voice-bridge/audio
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
