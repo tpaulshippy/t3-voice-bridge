@@ -43,12 +43,15 @@ def load_config(path):
         "db_path": "/home/ubuntu/.t3/userdata/statev2.sqlite",
         "models_dir": "./models",
         "max_retries": 3,
+        "transport": "telegram",
+        "audio_dir": "./audio",
+        "audio_base_url": None,
         "routing_sync_ssh": None,
         "routing_sync_state": "~/repos/t3-voice-bridge/state.json",
     }
     defaults.update(cfg)
     # resolve relative paths against repo dir
-    for k in ("state_file", "temp_dir", "models_dir"):
+    for k in ("state_file", "temp_dir", "models_dir", "audio_dir"):
         p = Path(defaults[k])
         if not p.is_absolute():
             defaults[k] = str(HERE / p)
@@ -228,6 +231,91 @@ def send_voice(token, chat_id, ogg_path, caption, max_retries=3):
     return False
 
 
+SLACK_API = "https://slack.com/api"
+
+
+def _slack_call(token, method, timeout=30, **data):
+    import requests
+
+    r = requests.post(f"{SLACK_API}/{method}",
+                      headers={"Authorization": f"Bearer {token}"},
+                      data=data, timeout=timeout)
+    body = r.json()
+    if r.status_code == 429:
+        body = {"ok": False, "error": "ratelimited",
+                "retry_after": int(r.headers.get("Retry-After", 5))}
+    return body
+
+
+def send_voice_slack(token, channel, ogg_path, caption, max_retries=3):
+    """Upload ogg via files.getUploadURLExternal -> POST -> completeUploadExternal."""
+    import requests
+
+    size = os.path.getsize(ogg_path)
+    last = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            up = _slack_call(token, "files.getUploadURLExternal",
+                             filename="voice.ogg", length=size)
+            if not up.get("ok"):
+                raise RuntimeError(f"getUploadURLExternal: {up}")
+            with open(ogg_path, "rb") as f:
+                r = requests.post(up["upload_url"],
+                                  files={"file": ("voice.ogg", f, "audio/ogg")},
+                                  timeout=180)
+            if r.status_code != 200:
+                raise RuntimeError(f"upload http={r.status_code}")
+            done = _slack_call(
+                token, "files.completeUploadExternal",
+                files=json.dumps([{"id": up["file_id"], "title": (caption or "voice")[:250]}]),
+                channel_id=channel, initial_comment=(caption or "")[:4000],
+            )
+            if done.get("ok"):
+                return True
+            raise RuntimeError(f"completeUploadExternal: {done}")
+        except Exception as e:
+            last = repr(e)
+            log.warning("slack upload attempt %d failed: %s", attempt, last)
+            if "ratelimited" in last:
+                time.sleep(5 * attempt)
+        time.sleep(2 * attempt)
+    log.error("slack upload failed after %d attempts: %s", max_retries, last)
+    return False
+
+
+def send_text_slack(token, channel, text):
+    try:
+        return bool(_slack_call(token, "chat.postMessage",
+                                channel=channel, text=text[:4000]).get("ok"))
+    except Exception as e:
+        log.warning("chat.postMessage failed: %r", e)
+        return False
+
+
+def is_slack(cfg):
+    return cfg.get("transport") == "slack"
+
+
+def send_voice_link_slack(cfg, ogg_path, caption):
+    """Copy ogg into audio_dir (served over tailnet) and post its link."""
+    os.makedirs(cfg["audio_dir"], exist_ok=True)
+    name = time.strftime("%Y%m%d-%H%M%S-") + os.urandom(4).hex() + ".ogg"
+    shutil.copy(ogg_path, os.path.join(cfg["audio_dir"], name))
+    url = cfg["audio_base_url"].rstrip("/") + "/" + name
+    return send_text_slack(cfg["slack_bot_token"], cfg["slack_channel"],
+                           f"🔊 <{url}|{caption or 'voice'}>")
+
+
+def deliver_voice(cfg, ogg_path, caption):
+    if is_slack(cfg) and cfg.get("audio_base_url"):
+        return send_voice_link_slack(cfg, ogg_path, caption)
+    if is_slack(cfg):
+        return send_voice_slack(cfg["slack_bot_token"], cfg["slack_channel"],
+                                ogg_path, caption, cfg.get("max_retries", 3))
+    return send_voice(cfg["telegram_bot_token"], cfg["telegram_chat_id"],
+                      ogg_path, caption, cfg.get("max_retries", 3))
+
+
 def caption_for(status, title, run_id, n_chunks=1, idx=1):
     base = f"{title}"
     if status != "completed":
@@ -248,7 +336,9 @@ def process_run(cfg, con, tts, run_id, thread_id, status, tmpdir, dry_run=False,
         if dry_run:
             print(f"DRY: run {run_id} status={status} -> would send TEXT note, caption={cap!r}")
             return True
-        if cfg.get("telegram_bot_token") and cfg["telegram_bot_token"] != "PASTE_FROM_BOTFATHER":
+        if is_slack(cfg) and cfg.get("slack_bot_token"):
+            return send_text_slack(cfg["slack_bot_token"], cfg["slack_channel"], cap)
+        if not is_slack(cfg) and cfg.get("telegram_bot_token") and cfg["telegram_bot_token"] != "PASTE_FROM_BOTFATHER":
             return send_text_note(cfg, cap)
         log.info("run %s status=%s, skipping audio (no token -> skip text too)", run_id, status)
         return True  # advance watermark; nothing to speak
@@ -270,7 +360,7 @@ def process_run(cfg, con, tts, run_id, thread_id, status, tmpdir, dry_run=False,
             total_bytes += n
             print(f"DRY chunk {i}/{len(chunks)}: {dur:.1f}s, {n} bytes, text={c[:80]!r}...")
         print(f"would send {len(chunks)} voice note(s) ({total_bytes} bytes total) "
-              f"to chat {cfg.get('telegram_chat_id')} "
+              f"to {'slack ' + str(cfg.get('slack_channel')) if is_slack(cfg) else 'chat ' + str(cfg.get('telegram_chat_id'))} "
               f"caption={title[:80]!r}")
         return True
     ok_all = True
@@ -280,8 +370,7 @@ def process_run(cfg, con, tts, run_id, thread_id, status, tmpdir, dry_run=False,
         tts.synth(c, wav)
         to_ogg(wav, ogg)
         cap = caption_for(status, title, run_id, len(chunks), i)
-        mid = send_voice(cfg["telegram_bot_token"], cfg["telegram_chat_id"],
-                         ogg, cap, cfg.get("max_retries", 3))
+        mid = deliver_voice(cfg, ogg, cap)
         if not mid:
             ok_all = False
             break  # do not advance watermark; retry next poll
