@@ -18,6 +18,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -46,6 +47,8 @@ def load_config(path):
         "transport": "telegram",
         "audio_dir": "./audio",
         "audio_base_url": None,
+        "t3_web_url": "t3code://threads",
+        "t3_environment_id": None,
         "routing_sync_ssh": None,
         "routing_sync_state": "~/repos/t3-voice-bridge/state.json",
     }
@@ -296,19 +299,35 @@ def is_slack(cfg):
     return cfg.get("transport") == "slack"
 
 
-def send_voice_link_slack(cfg, ogg_path, caption):
+def thread_link(cfg, thread_id):
+    env = cfg.get("t3_environment_id")
+    if not env:
+        try:
+            env = Path("~/.t3/userdata/environment-id").expanduser().read_text().strip()
+        except OSError:
+            return None
+    return f"{cfg['t3_web_url'].rstrip('/')}/{env}/{urllib.parse.quote(thread_id, safe='')}"
+
+
+def send_voice_link_slack(cfg, ogg_path, caption, thread_id=None, words=None):
     """Copy ogg into audio_dir (served over tailnet) and post its link."""
     os.makedirs(cfg["audio_dir"], exist_ok=True)
     name = time.strftime("%Y%m%d-%H%M%S-") + os.urandom(4).hex() + ".ogg"
     shutil.copy(ogg_path, os.path.join(cfg["audio_dir"], name))
     url = cfg["audio_base_url"].rstrip("/") + "/" + name
-    return send_text_slack(cfg["slack_bot_token"], cfg["slack_channel"],
-                           f"🔊 <{url}|{caption or 'voice'}>")
+    secs = round(ogg_duration(ogg_path))
+    parts = [f"🔊 <{url}|{caption or 'voice'}>", f"{secs // 60}:{secs % 60:02d}"]
+    if words is not None:
+        parts.append(f"{words} words")
+    link = thread_id and thread_link(cfg, thread_id)
+    if link:
+        parts.append(f"<{link}|Open thread>")
+    return send_text_slack(cfg["slack_bot_token"], cfg["slack_channel"], " · ".join(parts))
 
 
-def deliver_voice(cfg, ogg_path, caption):
+def deliver_voice(cfg, ogg_path, caption, thread_id=None, words=None):
     if is_slack(cfg) and cfg.get("audio_base_url"):
-        return send_voice_link_slack(cfg, ogg_path, caption)
+        return send_voice_link_slack(cfg, ogg_path, caption, thread_id, words)
     if is_slack(cfg):
         return send_voice_slack(cfg["slack_bot_token"], cfg["slack_channel"],
                                 ogg_path, caption, cfg.get("max_retries", 3))
@@ -379,7 +398,7 @@ def process_run(cfg, con, tts, run_id, thread_id, status, tmpdir, dry_run=False,
                 send_text_note(cfg, note)
             continue
         cap = caption_for(status, title, run_id, len(chunks), i)
-        mid = deliver_voice(cfg, ogg, cap)
+        mid = deliver_voice(cfg, ogg, cap, thread_id, len(c.split()))
         if not mid:
             ok_all = False
             break  # do not advance watermark; retry next poll

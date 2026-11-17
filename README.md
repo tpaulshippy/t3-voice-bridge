@@ -94,6 +94,8 @@ logs in `bridge.log`.
 | `slack_bot_token` | Slack bot token (`xoxb-`), scopes `files:write` + `chat:write`; bot must be in the channel | — |
 | `slack_channel` | Slack channel id (e.g. `C0123…`) to post voice files into | — |
 | `audio_base_url` | (Slack) if set, skip file upload: copy ogg into `audio_dir` and post a link `<audio_base_url>/<file>` instead (no `files:write` needed) | null |
+| `t3_web_url` | (Slack link mode) base for the "Open thread" link: `<t3_web_url>/<env id>/<thread id>`. Default opens the desktop app | `t3code://threads` |
+| `t3_environment_id` | T3 environment id for that link; read from `~/.t3/userdata/environment-id` when unset | null |
 | `audio_dir` | dir served at `audio_base_url` (e.g. `python3 -m http.server 3901 --bind 127.0.0.1 --directory audio` + `tailscale serve --bg --https=13901 http://localhost:3901`) | `./audio` |
 | `telegram_bot_token` | BotFather token (required for real sends) | — |
 | `telegram_chat_id` | numeric chat id (required for real sends) | — |
