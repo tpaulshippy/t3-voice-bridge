@@ -52,6 +52,8 @@ def load_config(path):
         "t3_environment_id": None,
         "routing_sync_ssh": None,
         "routing_sync_state": "~/repos/t3-voice-bridge/state.json",
+        "mac_web_url": None,
+        "mac_environment_id": None,
     }
     defaults.update(cfg)
     # resolve relative paths against repo dir
@@ -304,13 +306,22 @@ def is_slack(cfg):
 
 
 def thread_link(cfg, thread_id):
-    env = cfg.get("t3_environment_id")
+    base = cfg.get("t3_web_url") or "t3code://threads"
+    tid, env = thread_id, cfg.get("t3_environment_id")
+    if tid.startswith("mac:"):
+        # thread lives on the Mac T3 server: Mac origin + Mac environment
+        tid = tid[4:]
+        base = cfg.get("mac_web_url") or \
+            "http://%s:3773" % cfg.get("mac_host", "100.84.1.93")
+        env = cfg.get("mac_environment_id")
+        if not env:
+            return None
     if not env:
         try:
             env = Path("~/.t3/userdata/environment-id").expanduser().read_text().strip()
         except OSError:
             return None
-    return f"{cfg['t3_web_url'].rstrip('/')}/{env}/{urllib.parse.quote(thread_id, safe='')}"
+    return f"{base.rstrip('/')}/{env}/{urllib.parse.quote(tid, safe='')}"
 
 
 def is_msg_id(mid):
