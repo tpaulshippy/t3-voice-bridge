@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -42,6 +43,8 @@ def load_config(path):
         "db_path": "/home/ubuntu/.t3/userdata/statev2.sqlite",
         "models_dir": "./models",
         "max_retries": 3,
+        "routing_sync_ssh": None,
+        "routing_sync_state": "~/repos/t3-voice-bridge/state.json",
     }
     defaults.update(cfg)
     # resolve relative paths against repo dir
@@ -155,9 +158,20 @@ class TTS:
         return sr
 
 
+def _bin(name):
+    """Resolve a media binary robustly under launchd's minimal PATH."""
+    found = shutil.which(name)
+    if found:
+        return found
+    for cand in (f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}"):
+        if os.path.exists(cand):
+            return cand
+    return name
+
+
 def to_ogg(wav_path, ogg_path):
     r = subprocess.run(
-        ["ffmpeg", "-y", "-v", "error", "-i", wav_path,
+        [_bin("ffmpeg"), "-y", "-v", "error", "-i", wav_path,
          "-c:a", "libopus", "-b:a", "64k", "-vbr", "on",
          "-ar", "24000", "-ac", "1", ogg_path],
         capture_output=True, text=True,
@@ -180,7 +194,7 @@ def send_voice(token, chat_id, ogg_path, caption, max_retries=3):
                     url,
                     data={"chat_id": chat_id, "caption": cap},
                     files={"voice": ("voice.ogg", f, "audio/ogg")},
-                    timeout=60,
+                    timeout=180,
                 )
             try:
                 body = r.json()
@@ -215,7 +229,9 @@ def send_voice(token, chat_id, ogg_path, caption, max_retries=3):
 
 
 def caption_for(status, title, run_id, n_chunks=1, idx=1):
-    base = f"{title} [{status}]"
+    base = f"{title}"
+    if status != "completed":
+        base += f" [{status}]"
     if n_chunks > 1:
         base += f" ({idx}/{n_chunks})"
     if status != "completed":
@@ -292,11 +308,14 @@ def send_text_note(cfg, text):
         return False
 
 
-def record_outbound(state_path, pairs):
+def record_outbound(state_path, pairs, cfg=None):
     """Persist telegram message_id -> thread_id for inbound reply routing.
 
     Re-reads state from disk first so the inbound daemon's offset key
     (and vice versa) isn't clobbered. Map capped at 200 entries.
+    When cfg has routing_sync_ssh, the same pairs are merged into the
+    (single) inbound daemon's state file over ssh so reply-routing works
+    across machines. Sync failure never blocks the local save.
     """
     try:
         state = load_state(state_path)
@@ -314,12 +333,52 @@ def record_outbound(state_path, pairs):
         save_state(state_path, state)
     except Exception as e:
         log.warning("record_outbound failed: %r", e)
+    if pairs and cfg and cfg.get("routing_sync_ssh"):
+        sync_routing_map(cfg, dict(m))
+
+
+REMOTE_MERGE = (
+    "import json,sys,os;"
+    "pairs=json.loads(sys.argv[1]);"
+    "sp=os.path.expanduser(sys.argv[2]);"
+    "st=json.load(open(sp)) if os.path.exists(sp) else {};"
+    "m=st.get('outbound_msg_thread') or {};"
+    "m.update({str(k):v for k,v in pairs.items()});"
+    "[m.pop(k) for k in list(m)[:max(0,len(m)-200)]];"
+    "st['outbound_msg_thread']=m;"
+    "st['outbound_last_thread']=list(pairs.values())[-1];"
+    "tmp=sp+'.tmp';json.dump(st,open(tmp,'w'));os.replace(tmp,sp)"
+)
+
+
+def sync_routing_map(cfg, full_map):
+    """Merge our outbound map into the inbound host's state file via ssh."""
+    import shlex
+
+    try:
+        # ship only recent entries to keep the command small; tag values
+        # mac: so the inbound side knows to inject via the Mac T3 server
+        items = {k: (v if str(v).startswith("mac:") else "mac:" + str(v))
+                 for k, v in list(full_map.items())[-200:]}
+        remote_cmd = " ".join([
+            "python3", "-c", shlex.quote(REMOTE_MERGE),
+            shlex.quote(json.dumps(items)),
+            shlex.quote(cfg.get("routing_sync_state", "state.json")),
+        ])
+        r = subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=10", cfg["routing_sync_ssh"], remote_cmd],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            log.warning("routing sync failed: %s", r.stderr[-200:])
+    except Exception as e:
+        log.warning("routing sync error: %r", e)
 
 
 def ogg_duration(ogg_path):
     try:
         r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+            [_bin("ffprobe"), "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", ogg_path],
             capture_output=True, text=True,
         )
@@ -412,7 +471,7 @@ def main():
                                      tmpdir, sent_ids=sent)
                 if ok:
                     if sent:
-                        record_outbound(state_path, sent)
+                        record_outbound(state_path, sent, cfg)
                     global_wm = max(global_wm, completed_at)
                     state["_global"] = global_wm
                     state[thread_id] = max(state.get(thread_id, ""), completed_at)
