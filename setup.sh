@@ -20,7 +20,7 @@ fi
 # shellcheck disable=SC1091
 . "$VENV/bin/activate"
 pip install --upgrade pip
-pip install kokoro-onnx soundfile numpy requests
+pip install kokoro-onnx soundfile numpy requests faster-whisper websockets
 
 mkdir -p "$MODELS_DIR"
 BASE="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.1"
@@ -51,6 +51,9 @@ need() { # need <file> <url> <min_bytes>
 
 need "$MODELS_DIR/kokoro-v1.0.onnx" "$BASE/kokoro-v1.0.onnx" 250000000
 need "$MODELS_DIR/voices-v1.0.bin"  "$BASE/voices-v1.0.bin"  10000000
+
+echo "==> prefetching faster-whisper tiny model"
+"$VENV/bin/python" -c "from faster_whisper import WhisperModel; WhisperModel('tiny', device='cpu', compute_type='int8')"
 
 echo "==> checking espeak-ng + ffmpeg"
 command -v espeak-ng >/dev/null || { echo "ERROR: espeak-ng missing" >&2; exit 1; }

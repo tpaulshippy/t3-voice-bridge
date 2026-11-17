@@ -81,3 +81,70 @@ history); with an empty list it starts at startup time.
   (`sqlite3 "file:...statev2.sqlite?mode=ro" "SELECT ... FROM
   orchestration_v2_projection_runs ORDER BY completed_at DESC LIMIT 3"`),
   and that `thread_ids` (if set) includes it.
+
+## Inbound: Telegram voice message → T3 thread
+
+Separate daemon (`inbound.py`, own systemd unit). Long-polls Telegram
+`getUpdates` for voice/audio notes from `telegram_chat_id`, downloads the
+`.ogg`, converts to 16k mono wav, transcribes with faster-whisper, and
+injects the text with a 🎙 prefix via the local server
+WebSocket RPC (`orchestration.dispatchCommand` / `message.dispatch`,
+`deliveryIntent: auto`, `dispatchMode: start_immediately`). Telegram gets a
+text confirmation (transcript + status, e.g. server sequence number).
+
+Routing is reply-aware, not pinned to one thread: the outbound leg records
+every delivered voice note (`state.json`: `outbound_msg_thread`
+`{telegram_message_id: thread_id}`, capped at 200, plus
+`outbound_last_thread`). Precedence per inbound note:
+**reply** (its `reply_to_message` matches a mapped outbound voice note) →
+**recent** (thread of the most recent outbound voice note) →
+**fallback** (`inbound_thread_id` override; may be left empty, in which case
+an unroutable note gets a Telegram explanation and is skipped). So a voice note sent
+freestanding lands in the thread of the last voice note you received, and a
+voice note sent as a reply to a specific voice note routes to that thread.
+
+### One-time setup
+
+No T3 Connect / webhook needed — the daemon talks to the local server over
+`ws://127.0.0.1:3773` (ticket from `POST /api/auth/websocket-ticket/rpc`,
+protocol params `orchestrationProtocol=2&clientCapabilities=settingsSecretReferences`).
+It mints its own bearer via
+`t3 auth session issue --scope orchestration:read --scope orchestration:operate`,
+so nothing to configure there.
+
+1. `./setup.sh` (adds `faster-whisper` + `websockets` to the venv, prefetches
+   the tiny STT model into `~/.cache/huggingface`).
+2. Find your thread id (copy the sqlite first — WAL + read-only reads go stale):
+   ```
+   cp ~/.t3/userdata/statev2.sqlite /tmp/s.sqlite
+   sqlite3 /tmp/s.sqlite "SELECT thread_id, title FROM orchestration_v2_projection_threads WHERE title LIKE '%Voice%';"
+   ```
+3. Edit `config.json`:
+   `inbound_enabled: true`,
+   `inbound_thread_id: "<uuid>"` (required),
+   optional `stt_model` (default `"tiny"`) and `stt_language` (default `"en"`).
+4. Test once: `./bridge-venv/bin/python inbound.py --once` (send yourself a
+   voice note first, or use `--dry-run` to only transcribe + print).
+5. Enable: `cp t3-voice-bridge-inbound.service ~/.config/systemd/user/`,
+   `systemctl --user daemon-reload`,
+   `systemctl --user enable --now t3-voice-bridge-inbound`.
+
+### Config keys (inbound)
+
+| key | meaning | default |
+|---|---|---|
+| `inbound_enabled` | run the inbound poller | `false` |
+| `inbound_thread_id` | explicit override thread uuid; when empty/null, routing is purely reply-aware (reply → most-recent outbound thread) | `null` |
+| `stt_model` | faster-whisper model (`tiny`, `base`, …) | `"tiny"` |
+| `stt_language` | transcription language (`en`, …; `null` = auto-detect) | `"en"` |
+
+Shares `config.json` / `state.json` with the outbound bridge; the Telegram
+offset lives under the namespaced `inbound_update_offset` key.
+
+### Failure behavior
+
+- Offset advances ONLY after a successful inject. Non-voice updates and
+  wrong-chat messages are skipped (offset advances).
+- Transcribe/inject failure → Telegram gets a ⚠️ error note and the offset
+  is **held** for retry on the next poll.
+- Empty transcript → Telegram note, offset advances (nothing to inject).

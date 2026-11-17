@@ -1,0 +1,14 @@
+[Unit]
+Description=Telegram voice-message to T3 thread inbound bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/repos/t3-voice-bridge
+ExecStart=%h/repos/t3-voice-bridge/bridge-venv/bin/python %h/repos/t3-voice-bridge/inbound.py --config %h/repos/t3-voice-bridge/config.json
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

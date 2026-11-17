@@ -187,7 +187,10 @@ def send_voice(token, chat_id, ogg_path, caption, max_retries=3):
             except ValueError:
                 body = {}
             if r.status_code == 200 and body.get("ok"):
-                return True
+                try:
+                    return body["result"]["message_id"]
+                except (KeyError, TypeError):
+                    return True
             # rate limited?
             if r.status_code in (429,) or body.get("error_code") == 429:
                 retry_after = 5 * attempt
@@ -220,7 +223,8 @@ def caption_for(status, title, run_id, n_chunks=1, idx=1):
     return base[:1024]
 
 
-def process_run(cfg, con, tts, run_id, thread_id, status, tmpdir, dry_run=False):
+def process_run(cfg, con, tts, run_id, thread_id, status, tmpdir, dry_run=False,
+                sent_ids=None):
     title = thread_title_v2(con, thread_id)
     if status != "completed":
         # speak nothing; text-mode note only
@@ -260,10 +264,13 @@ def process_run(cfg, con, tts, run_id, thread_id, status, tmpdir, dry_run=False)
         tts.synth(c, wav)
         to_ogg(wav, ogg)
         cap = caption_for(status, title, run_id, len(chunks), i)
-        if not send_voice(cfg["telegram_bot_token"], cfg["telegram_chat_id"],
-                          ogg, cap, cfg.get("max_retries", 3)):
+        mid = send_voice(cfg["telegram_bot_token"], cfg["telegram_chat_id"],
+                         ogg, cap, cfg.get("max_retries", 3))
+        if not mid:
             ok_all = False
             break  # do not advance watermark; retry next poll
+        if sent_ids is not None and isinstance(mid, int):
+            sent_ids.append((mid, thread_id))
         for p in (wav, ogg):
             try:
                 os.remove(p)
@@ -283,6 +290,30 @@ def send_text_note(cfg, text):
     except Exception as e:
         log.warning("sendMessage failed: %r", e)
         return False
+
+
+def record_outbound(state_path, pairs):
+    """Persist telegram message_id -> thread_id for inbound reply routing.
+
+    Re-reads state from disk first so the inbound daemon's offset key
+    (and vice versa) isn't clobbered. Map capped at 200 entries.
+    """
+    try:
+        state = load_state(state_path)
+    except Exception:
+        state = {}
+    m = state.get("outbound_msg_thread") or {}
+    for mid, tid in pairs:
+        m[str(mid)] = tid
+    while len(m) > 200:
+        m.pop(next(iter(m)))
+    state["outbound_msg_thread"] = m
+    if pairs:
+        state["outbound_last_thread"] = pairs[-1][1]
+    try:
+        save_state(state_path, state)
+    except Exception as e:
+        log.warning("record_outbound failed: %r", e)
 
 
 def ogg_duration(ogg_path):
@@ -376,8 +407,12 @@ def main():
             rows = new_runs_since(con2, global_wm, cfg.get("thread_ids") or [])
             for run_id, thread_id, status, completed_at in rows:
                 with tempfile.TemporaryDirectory(dir=cfg["temp_dir"]) as tmpdir:
-                    ok = process_run(cfg, con2, tts, run_id, thread_id, status, tmpdir)
+                    sent = []
+                    ok = process_run(cfg, con2, tts, run_id, thread_id, status,
+                                     tmpdir, sent_ids=sent)
                 if ok:
+                    if sent:
+                        record_outbound(state_path, sent)
                     global_wm = max(global_wm, completed_at)
                     state["_global"] = global_wm
                     state[thread_id] = max(state.get(thread_id, ""), completed_at)

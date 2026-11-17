@@ -9,5 +9,9 @@
   "temp_dir": "./tmp",
   "db_path": "/home/ubuntu/.t3/userdata/statev2.sqlite",
   "models_dir": "./models",
-  "max_retries": 3
+  "max_retries": 3,
+  "inbound_enabled": false,
+  "inbound_thread_id": null,
+  "stt_model": "tiny",
+  "stt_language": "en"
 }
